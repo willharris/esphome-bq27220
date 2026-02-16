@@ -141,6 +141,9 @@ class BQ27220Component : public PollingComponent, public i2c::I2CDevice {
   sensor::Sensor *state_of_health_sensor_{nullptr};
   sensor::Sensor *device_number_sensor_{nullptr};
 
+  // Track whether the gauge is reachable on the I2C bus
+  bool gauge_available_{false};
+
   
     bool getIsCharging(void){
         BQ27220BatteryStatus batt;
@@ -176,32 +179,30 @@ class BQ27220Component : public PollingComponent, public i2c::I2CDevice {
     uint16_t getStateOfCharge(void);
     uint16_t getStateOfHealth(void);
 
-    // i2c
+    // i2c - PATCHED: now checks return value and zeros buffer on failure
     uint16_t readRegU16(uint16_t reg) {
-        uint8_t data[2];
-        this->read_register(static_cast<uint8_t>(reg), data, size_t{2});
+        uint8_t data[2] = {0, 0};
+        if (!this->read_register(static_cast<uint8_t>(reg), data, size_t{2})) {
+            ESP_LOGW("bq27220", "I2C read failed for register 0x%02X", reg);
+            this->gauge_available_ = false;
+            return 0;
+        } else {
+            this->gauge_available_ = true;
+        }
         return ((uint16_t) data[1] << 8) | data[0];
     }
-
-    // uint16_t readCtrlWord(uint16_t fun) {
-    //     uint8_t msb = (fun >> 8);
-    //     uint8_t lsb = (fun & 0x00FF);
-    //     uint8_t cmd[2] = { lsb, msb };
-    //     uint8_t data[2] = {0};
-
-    //     this->write_register(static_cast<uint8_t>((uint8_t)BQ27220_COMMAND_CONTROL, cmd, 2);
-
-    //     if (this->read_register(static_cast<uint8_t>((uint8_t) 0, data, 2)) {
-    //         return ((uint16_t)data[1] << 8) | data[0];
-    //     }
-    //     return 0;
-    // }
 
     bool controlSubCmd(uint16_t sub_cmd) {
         uint8_t msb = (sub_cmd >> 8);
         uint8_t lsb = (sub_cmd & 0x00FF);
         uint8_t buf[2] = { lsb, msb };
-        this->write_register(static_cast<uint8_t>(CommandControl), buf, 2);
+        if (!this->write_register(static_cast<uint8_t>(CommandControl), buf, 2)) {
+            ESP_LOGW("bq27220", "I2C write failed for control sub-command 0x%04X", sub_cmd);
+            this->gauge_available_ = false;
+            return false;
+        } else {
+            this->gauge_available_ = true;
+        }
         return true;
     }
 private:

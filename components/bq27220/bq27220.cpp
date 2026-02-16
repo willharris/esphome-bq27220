@@ -336,6 +336,7 @@ bool BQ27220Component::unsealAccess(void)
 {
     bool result = false;
     BQ27220OperationStatus operat = {0};
+
     do{
         getOperationStatus(&operat);
         if(operat.reg.SEC != Bq27220OperationStatusSecSealed)
@@ -486,78 +487,161 @@ uint16_t BQ27220Component::getStateOfHealth(void)
 
 
 void BQ27220Component::setup() {
-  ESP_LOGI(TAG, "Initializing BQ27220");
-  
-ESP_LOGI("bq27220", "BQ27220 setup complete.");
+    ESP_LOGI(TAG, "Initializing BQ27220...");
+
+    // Probe the device: try a simple read to see if it's on the bus
+    uint8_t probe[2] = {0, 0};
+    if (this->read_register(static_cast<uint8_t>(CommandControl), probe, 2)) {
+        this->gauge_available_ = true;
+        ESP_LOGI(TAG, "BQ27220 detected on I2C bus (probe read OK)");
+
+        // Check device ID
+        uint16_t devid = this->getDeviceNumber();
+        ESP_LOGI(TAG, "BQ27220 Device Number: 0x%04X (expected 0x%04X)", devid, BQ27220_ID);
+        if (devid != BQ27220_ID) {
+            ESP_LOGW(TAG, "Unexpected device ID! Gauge may not be a BQ27220.");
+        }
+    } else {
+        this->gauge_available_ = false;
+        ESP_LOGW(TAG, "BQ27220 NOT detected on I2C bus at address 0x55!");
+        ESP_LOGW(TAG, "The fuel gauge may be in SHUTDOWN mode. Possible causes:");
+        ESP_LOGW(TAG, "  - Battery is fully depleted");
+        ESP_LOGW(TAG, "  - Battery protection circuit has tripped");
+        ESP_LOGW(TAG, "  - Gauge entered SHUTDOWN and needs a wake signal on GPOUT");
+        ESP_LOGW(TAG, "Try: charge via USB for 1+ hour, then power-cycle the device.");
+        ESP_LOGW(TAG, "Sensor readings will show as unavailable until the gauge responds.");
+    }
 }
 
   
 void BQ27220Component::update() {
 
+    // If gauge was previously unavailable, try probing again each update cycle.
+    // This way, if the battery charges enough to wake the gauge, we'll pick it up.
+    if (!this->gauge_available_) {
+        uint8_t probe[2] = {0, 0};
+        if (this->read_register(static_cast<uint8_t>(CommandControl), probe, 2)) {
+            this->gauge_available_ = true;
+            ESP_LOGI(TAG, "BQ27220 is now responding on I2C bus! Resuming readings.");
+        } else {
+            // Still not available - publish NaN for all sensors so HA shows "unavailable"
+            // instead of stale garbage values.
+            ESP_LOGD(TAG, "BQ27220 still not responding on I2C bus, skipping update.");
+            if (voltage_sensor_ != nullptr) voltage_sensor_->publish_state(NAN);
+            if (current_sensor_ != nullptr) current_sensor_->publish_state(NAN);
+            if (soc_sensor_ != nullptr) soc_sensor_->publish_state(NAN);
+            if (remaining_capacity_sensor_ != nullptr) remaining_capacity_sensor_->publish_state(NAN);
+            if (temperature_sensor_ != nullptr) temperature_sensor_->publish_state(NAN);
+            if (full_charge_capacity_sensor_ != nullptr) full_charge_capacity_sensor_->publish_state(NAN);
+            if (design_capacity_sensor_ != nullptr) design_capacity_sensor_->publish_state(NAN);
+            if (state_of_health_sensor_ != nullptr) state_of_health_sensor_->publish_state(NAN);
+            if (device_number_sensor_ != nullptr) device_number_sensor_->publish_state(NAN);
+            return;
+        }
+    }
+
+    // Reset availability flag - readRegU16 will set it to false if any read fails.
+    this->gauge_available_ = true;
+
     // Publish Voltage 
-    uint16_t voltage_mv = this->getVoltage(); 
+    uint16_t voltage_mv = this->getVoltage();
+    if (!this->gauge_available_) { goto comm_failed; }
     ESP_LOGD(TAG, "Voltage: %u mV", voltage_mv);
     if (voltage_sensor_ != nullptr) {
       voltage_sensor_->publish_state(voltage_mv / 1000.0f); 
     }
   
     // Publish Current 
-    int16_t current_raw = this->getCurrent(); 
-    ESP_LOGD(TAG, "Current: %d mA", current_raw);
-    if (current_sensor_ != nullptr) {
-      current_sensor_->publish_state(current_raw);
-    } 
+    {
+        int16_t current_raw = this->getCurrent();
+        if (!this->gauge_available_) { goto comm_failed; }
+        ESP_LOGD(TAG, "Current: %d mA", current_raw);
+        if (current_sensor_ != nullptr) {
+          current_sensor_->publish_state(current_raw);
+        }
+    }
   
     // Publish SOC
-    uint8_t soc = this->getStateOfCharge(); // UNTESTED - report back on results
-    ESP_LOGD(TAG, "State of Charge: %u%%", soc);
-    if (soc_sensor_ != nullptr) {
-        soc_sensor_->publish_state(soc);
-      }
+    {
+        uint8_t soc = this->getStateOfCharge();
+        if (!this->gauge_available_) { goto comm_failed; }
+        ESP_LOGD(TAG, "State of Charge: %u%%", soc);
+        if (soc_sensor_ != nullptr) {
+            soc_sensor_->publish_state(soc);
+        }
+    }
       
     // Publish Remaining Capacity
-    uint16_t remaining_mah = this->getRemainingCapacity();
-    ESP_LOGD(TAG, "Remaining Capacity: %u mAh", remaining_mah);
-    if (remaining_capacity_sensor_ != nullptr) {
-        remaining_capacity_sensor_->publish_state(remaining_mah);
-      }
+    {
+        uint16_t remaining_mah = this->getRemainingCapacity();
+        if (!this->gauge_available_) { goto comm_failed; }
+        ESP_LOGD(TAG, "Remaining Capacity: %u mAh", remaining_mah);
+        if (remaining_capacity_sensor_ != nullptr) {
+            remaining_capacity_sensor_->publish_state(remaining_mah);
+        }
+    }
     
     // Publish Temperature
-    uint16_t raw_temp = this->getTemperature();
-    ESP_LOGD(TAG, "RawTemperature: %u", raw_temp);
-    float temperature = (raw_temp * 0.1f) - 273.15f;
-    ESP_LOGD(TAG, "Temperature: %.2f °C", temperature);
-    if (temperature_sensor_ != nullptr) {
-        temperature_sensor_->publish_state(temperature);
-      }
+    {
+        uint16_t raw_temp = this->getTemperature();
+        if (!this->gauge_available_) { goto comm_failed; }
+        ESP_LOGD(TAG, "RawTemperature: %u", raw_temp);
+        float temperature = (raw_temp * 0.1f) - 273.15f;
+        ESP_LOGD(TAG, "Temperature: %.2f °C", temperature);
+        if (temperature_sensor_ != nullptr) {
+            temperature_sensor_->publish_state(temperature);
+        }
+    }
     
     // Publish Full Charge Capacity
-    uint16_t fcc_mah = this->getFullChargeCapacity();
-    ESP_LOGD(TAG, "Full Charge Capacity: %u mAh", fcc_mah);
-    if (full_charge_capacity_sensor_ != nullptr) {
-        full_charge_capacity_sensor_->publish_state(fcc_mah);
-      }
+    {
+        uint16_t fcc_mah = this->getFullChargeCapacity();
+        if (!this->gauge_available_) { goto comm_failed; }
+        ESP_LOGD(TAG, "Full Charge Capacity: %u mAh", fcc_mah);
+        if (full_charge_capacity_sensor_ != nullptr) {
+            full_charge_capacity_sensor_->publish_state(fcc_mah);
+        }
+    }
       
     // Publish Design Capacity
-    uint16_t dc_mah = this->getDesignCapacity();
-    ESP_LOGD(TAG, "Design Capacity: %u mAh", dc_mah);
-    if (design_capacity_sensor_ != nullptr) {
-        design_capacity_sensor_->publish_state(dc_mah);
-      }
+    {
+        uint16_t dc_mah = this->getDesignCapacity();
+        if (!this->gauge_available_) { goto comm_failed; }
+        ESP_LOGD(TAG, "Design Capacity: %u mAh", dc_mah);
+        if (design_capacity_sensor_ != nullptr) {
+            design_capacity_sensor_->publish_state(dc_mah);
+        }
+    }
+
     // Publish State of Health
-    uint16_t soh = this->getStateOfHealth();
-    ESP_LOGD(TAG, "State of Health: %u%%", soh);
-    if (state_of_health_sensor_ != nullptr) {
-        state_of_health_sensor_->publish_state(soh);
-      }
+    {
+        uint16_t soh = this->getStateOfHealth();
+        if (!this->gauge_available_) { goto comm_failed; }
+        ESP_LOGD(TAG, "State of Health: %u%%", soh);
+        if (state_of_health_sensor_ != nullptr) {
+            state_of_health_sensor_->publish_state(soh);
+        }
+    }
 
     // Publish Device Number
-    uint16_t devnum = this->getDeviceNumber();
-    ESP_LOGD(TAG, "Device Number: 0x%04X", devnum);
-    if (device_number_sensor_ != nullptr) {
-        device_number_sensor_->publish_state(devnum);
-      }
+    {
+        uint16_t devnum = this->getDeviceNumber();
+        if (!this->gauge_available_) { goto comm_failed; }
+        ESP_LOGD(TAG, "Device Number: 0x%04X", devnum);
+        if (device_number_sensor_ != nullptr) {
+            device_number_sensor_->publish_state(devnum);
+        }
+    }
 
+    return;
+
+comm_failed:
+    ESP_LOGW(TAG, "BQ27220 communication lost during update, marking as unavailable.");
+    this->gauge_available_ = false;
+    // Publish NaN for any sensors we haven't updated yet this cycle.
+    // Already-published values this cycle were valid (pre-failure reads succeeded).
+    // On the next update() call, we'll probe and skip everything if still offline.
+    return;
 }
 
 }  // namespace bq27220
