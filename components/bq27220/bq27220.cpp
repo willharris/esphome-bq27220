@@ -35,6 +35,11 @@ static uint8_t bq27220_get_checksum(uint8_t* data, uint16_t len) {
     return 0xFF - ret;
 }
 
+// NOTE: parameterCheck and dateMemoryCheck use write_register/read_register
+// with ErrorCode returns. The original code used !this->write_register(...)
+// which is INVERTED for ErrorCode (0 = OK, non-zero = error).
+// Fixed to use != i2c::ERROR_OK.
+
 bool BQ27220Component::parameterCheck(uint16_t address, uint32_t value, size_t size, bool update)
 {
     if(!(size == 1 || size == 2 || size == 4)) {
@@ -55,39 +60,32 @@ bool BQ27220Component::parameterCheck(uint16_t address, uint32_t value, size_t s
         }
 
         if(update) {
-            if(!this->write_register(static_cast<uint8_t>(CommandSelectSubclass), buffer, size + 2)) {
+            if(this->write_register(static_cast<uint8_t>(CommandSelectSubclass), buffer, size + 2) != i2c::ERROR_OK) {
                 ESP_LOGD(TAG, "(%d) DM write failed\n", __LINE__);
                 break;
             }
-            // We must wait, otherwise write will fail
             delayMicroseconds(BQ27220_MAC_WRITE_DELAY_US);
 
-            // Calculate the check sum: 0xFF - (sum of address and data) OR 0xFF
             uint8_t checksum = bq27220_get_checksum(buffer, size + 2);
-            // Write the check sum to 0x60 and the total length of (address + parameter data + check sum + length) to 0x61
             buffer[0] = checksum;
-            // 2 bytes address, `size` bytes data, 1 byte check sum, 1 byte length
             buffer[1] = 2 + size + 1 + 1;
-            if(!this->write_register(static_cast<uint8_t>(CommandMACDataSum), buffer, size + 2)) {
+            if(this->write_register(static_cast<uint8_t>(CommandMACDataSum), buffer, size + 2) != i2c::ERROR_OK) {
                 ESP_LOGD(TAG, "(%d) CRC write failed\n", __LINE__);
                 break;
             }
-            // We must wait, otherwise write will fail
             delayMicroseconds(BQ27220_CONFIG_DELAY_US);
             ret = true;
         } else {
-            if(!this->write_register(static_cast<uint8_t>(CommandSelectSubclass), buffer, 2)) {
+            if(this->write_register(static_cast<uint8_t>(CommandSelectSubclass), buffer, 2) != i2c::ERROR_OK) {
                 ESP_LOGD(TAG, "(%d) DM SelectSubclass for read failed\n", __LINE__);
                 break;
             }
-            // bqstudio uses 15ms wait delay here
             delayMicroseconds(BQ27220_SELECT_DELAY_US);
 
-            if(!this->read_register(static_cast<uint8_t>(CommandMACData), old_data, size)) {
+            if(this->read_register(static_cast<uint8_t>(CommandMACData), old_data, size) != i2c::ERROR_OK) {
                 ESP_LOGD(TAG, "(%d) DM read failed\n", __LINE__);
                 break;
             }
-            // bqstudio uses burst reads with continue(CommandSelectSubclass without argument) and ~5ms between burst
             delayMicroseconds(BQ27220_SELECT_DELAY_US);
 
             if(*(uint32_t*)&(old_data[0]) != *(uint32_t*)&(buffer[2])) {
@@ -110,12 +108,11 @@ bool BQ27220Component::dateMemoryCheck(const BQ27220DMData *data_memory, bool up
 {
     if(update) {
         const uint16_t cfg_request = Control_ENTER_CFG_UPDATE;
-        if(!this->write_register(static_cast<uint8_t>(CommandSelectSubclass), (uint8_t*)&cfg_request, sizeof(cfg_request))) {
+        if(this->write_register(static_cast<uint8_t>(CommandSelectSubclass), (uint8_t*)&cfg_request, sizeof(cfg_request)) != i2c::ERROR_OK) {
             ESP_LOGD(TAG, "(%d) ENTER_CFG_UPDATE command failed", __LINE__);
             return false;
         }
 
-        // Wait for enter CFG update mode
         uint32_t timeout = BQ27220_TIMEOUT(BQ27220_TIMEOUT_COMMON_US);
         BQ27220OperationStatus operation_status;
         while(--timeout > 0) {
@@ -136,7 +133,6 @@ bool BQ27220Component::dateMemoryCheck(const BQ27220DMData *data_memory, bool up
         }
     }
 
-    // Process data memory records
     bool result = true;
     while (data_memory->type != BQ27220DMTypeEnd)
     {
@@ -168,14 +164,10 @@ bool BQ27220Component::dateMemoryCheck(const BQ27220DMData *data_memory, bool up
         data_memory++;
     }
     
-    // Finalize configuration update
     if(update && result) {
         controlSubCmd(Control_EXIT_CFG_UPDATE_REINIT);
-
-        // Wait for gauge to apply new configuration
         delayMicroseconds(BQ27220_CONFIG_APPLY_US);
 
-        // ensure that we exited config update mode
         uint32_t timeout = BQ27220_TIMEOUT(BQ27220_TIMEOUT_COMMON_US);
         BQ27220OperationStatus operation_status;
         while(--timeout > 0) {
@@ -187,7 +179,6 @@ bool BQ27220Component::dateMemoryCheck(const BQ27220DMData *data_memory, bool up
             delayMicroseconds(BQ27220_TIMEOUT_CYCLE_INTERVAL_US);
         }
 
-        // Check timeout
         if(timeout == 0) {
             ESP_LOGD(TAG, "(%d) Exit CFGUPDATE mode failed\n", __LINE__);
             return false;
@@ -208,12 +199,10 @@ bool BQ27220Component::init(const BQ27220DMData *data_memory)
             break;
         }
         
-        // Unseal device since we are going to read protected configuration
         if(!unsealAccess()) {
             break;
         }
 
-        // Try to recover gauge from forever init
         BQ27220OperationStatus operat;
         if(!getOperationStatus(&operat)) {
             break;
@@ -223,7 +212,6 @@ bool BQ27220Component::init(const BQ27220DMData *data_memory)
             reset_and_provisioning_required = true;
         }
 
-        // Ensure correct profile is selected
         ESP_LOGD(TAG, "(%d) Checking chosen profile\n", __LINE__);
         BQ27220ControlStatus control_status;
         if(!getControlStatus(&control_status)) {
@@ -235,8 +223,6 @@ bool BQ27220Component::init(const BQ27220DMData *data_memory)
             reset_and_provisioning_required = true;
         }
 
-        // Ensure correct configuration loaded into gauge DataMemory
-        // Only if reset is not required, otherwise we don't
         if(!reset_and_provisioning_required) {
             ESP_LOGD(TAG, "(%d) Checking data memory\n", __LINE__);
             if(!dateMemoryCheck(data_memory, false)) {
@@ -245,19 +231,15 @@ bool BQ27220Component::init(const BQ27220DMData *data_memory)
             }
         }
 
-        // Reset needed
         if(reset_and_provisioning_required) {
             if(!reset()) {
                 ESP_LOGD(TAG, "(%d) Failed to reset device\n", __LINE__);
             }
 
-            // Get full access to read and modify parameters
-            // Also it looks like this step is totally unnecessary
             if(!fullAccess()) {
                 break;
             }
 
-            // Update memory
             ESP_LOGD(TAG, "(%d) Updating data memory\n", __LINE__);
             dateMemoryCheck(data_memory, true);
             if(!dateMemoryCheck(data_memory, false)) {
@@ -280,7 +262,6 @@ bool BQ27220Component::reset(void)
     bool result = false;
     do{
         controlSubCmd(Control_RESET);
-        // delay(10);
 
         uint32_t timeout = BQ27220_TIMEOUT(BQ27220_TIMEOUT_RESET_US);
         BQ27220OperationStatus operat = {0};
@@ -291,7 +272,7 @@ bool BQ27220Component::reset(void)
             }else if(operat.reg.INITCOMP == true){
                 break;
             }
-            delayMicroseconds(BQ27220_TIMEOUT_CYCLE_INTERVAL_US); // delay(2);
+            delayMicroseconds(BQ27220_TIMEOUT_CYCLE_INTERVAL_US);
         }
         if(timeout == 0) {
             ESP_LOGD(TAG, "INITCOMP timeout after reset");
@@ -303,7 +284,6 @@ bool BQ27220Component::reset(void)
     return result;
 }
 
-// Sealed Access
 bool BQ27220Component::sealAccess(void) 
 {
     bool result = false;
@@ -317,7 +297,6 @@ bool BQ27220Component::sealAccess(void)
         }
 
         controlSubCmd(Control_SEALED);
-        // delay(10);
         delayMicroseconds(BQ27220_SELECT_DELAY_US);
 
         getOperationStatus(&operat);
@@ -346,9 +325,9 @@ bool BQ27220Component::unsealAccess(void)
         }
 
         controlSubCmd(UnsealKey1);
-        delayMicroseconds(BQ27220_MAGIC_DELAY_US); // delay(10);
+        delayMicroseconds(BQ27220_MAGIC_DELAY_US);
         controlSubCmd(UnsealKey2);
-        delayMicroseconds(BQ27220_MAGIC_DELAY_US);  // delay(10);
+        delayMicroseconds(BQ27220_MAGIC_DELAY_US);
 
         getOperationStatus(&operat);
         if(operat.reg.SEC != Bq27220OperationStatusSecUnsealed)
@@ -381,23 +360,20 @@ bool BQ27220Component::fullAccess(void)
             ESP_LOGD(TAG, "Failed to get operation status");
             break;
         }
-        // ESP_LOGD(TAG, "Cycles left: %lu\n", timeout);
 
-        // Already full access
         if(operat.reg.SEC == Bq27220OperationStatusSecFull){
             result = true;
             break;
         }
-        // Must be unsealed to get full access
         if(operat.reg.SEC != Bq27220OperationStatusSecUnsealed){
             ESP_LOGD(TAG, "(%d) Not in unsealed state\n", __LINE__);
             break;
         }
 
         controlSubCmd(FullAccessKey);
-        delayMicroseconds(BQ27220_MAGIC_DELAY_US); //delay(10);
+        delayMicroseconds(BQ27220_MAGIC_DELAY_US);
         controlSubCmd(FullAccessKey);
-        delayMicroseconds(BQ27220_MAGIC_DELAY_US); //delay(10);
+        delayMicroseconds(BQ27220_MAGIC_DELAY_US);
 
         if(!getOperationStatus(&operat)){
             ESP_LOGD(TAG, "Status query failed");
@@ -415,15 +391,9 @@ bool BQ27220Component::fullAccess(void)
 uint16_t BQ27220Component::getDeviceNumber(void)
 {
     uint16_t devid = 0;
-    // Request device number(chip PN)
     controlSubCmd(Control_DEVICE_NUMBER);
-    // Enterprise wait(MAC read fails if less than 500us)
-    // bqstudio uses ~15ms 
-    delayMicroseconds(BQ27220_SELECT_DELAY_US); // delay(15);
-    // Read id data from MAC scratch space
+    delayMicroseconds(BQ27220_SELECT_DELAY_US);
     this->read_register(static_cast<uint8_t>(CommandMACData), (uint8_t *)&devid, 2);
-
-    // ESP_LOGD(TAG, "device number:0x%x\n", devid);
     return devid;
 }
 
@@ -452,11 +422,8 @@ bool BQ27220Component::getOperationStatus(BQ27220OperationStatus *oper_sta)
 }
 bool BQ27220Component::getGaugingStatus(BQ27220GaugingStatus *gauging_sta)
 {
-    // Request gauging data to be loaded to MAC
     controlSubCmd(Control_GAUGING_STATUS);
-    // Wait for data being loaded to MAC
     delayMicroseconds(BQ27220_SELECT_DELAY_US);
-    // Read id data from MAC scratch space
     (*gauging_sta).full = readRegU16(CommandMACData);
     return true;
 }
@@ -486,16 +453,30 @@ uint16_t BQ27220Component::getStateOfHealth(void)
 }
 
 
+// Helper: publish NaN to all sensors (shows "unavailable" in HA)
+void BQ27220Component::publish_all_nan_() {
+    if (voltage_sensor_ != nullptr) voltage_sensor_->publish_state(NAN);
+    if (current_sensor_ != nullptr) current_sensor_->publish_state(NAN);
+    if (soc_sensor_ != nullptr) soc_sensor_->publish_state(NAN);
+    if (remaining_capacity_sensor_ != nullptr) remaining_capacity_sensor_->publish_state(NAN);
+    if (temperature_sensor_ != nullptr) temperature_sensor_->publish_state(NAN);
+    if (full_charge_capacity_sensor_ != nullptr) full_charge_capacity_sensor_->publish_state(NAN);
+    if (design_capacity_sensor_ != nullptr) design_capacity_sensor_->publish_state(NAN);
+    if (state_of_health_sensor_ != nullptr) state_of_health_sensor_->publish_state(NAN);
+    if (device_number_sensor_ != nullptr) device_number_sensor_->publish_state(NAN);
+}
+
+
 void BQ27220Component::setup() {
     ESP_LOGI(TAG, "Initializing BQ27220...");
 
-    // Probe the device: try a simple read to see if it's on the bus
+    // Probe the device: try reading the Control register
     uint8_t probe[2] = {0, 0};
-    if (this->read_register(static_cast<uint8_t>(CommandControl), probe, 2)) {
+    auto err = this->read_register(static_cast<uint8_t>(CommandControl), probe, 2);
+    if (err == i2c::ERROR_OK) {
         this->gauge_available_ = true;
-        ESP_LOGI(TAG, "BQ27220 detected on I2C bus (probe read OK)");
+        ESP_LOGI(TAG, "BQ27220 detected on I2C bus (probe OK)");
 
-        // Check device ID
         uint16_t devid = this->getDeviceNumber();
         ESP_LOGI(TAG, "BQ27220 Device Number: 0x%04X (expected 0x%04X)", devid, BQ27220_ID);
         if (devid != BQ27220_ID) {
@@ -503,145 +484,94 @@ void BQ27220Component::setup() {
         }
     } else {
         this->gauge_available_ = false;
-        ESP_LOGW(TAG, "BQ27220 NOT detected on I2C bus at address 0x55!");
-        ESP_LOGW(TAG, "The fuel gauge may be in SHUTDOWN mode. Possible causes:");
-        ESP_LOGW(TAG, "  - Battery is fully depleted");
-        ESP_LOGW(TAG, "  - Battery protection circuit has tripped");
-        ESP_LOGW(TAG, "  - Gauge entered SHUTDOWN and needs a wake signal on GPOUT");
-        ESP_LOGW(TAG, "Try: charge via USB for 1+ hour, then power-cycle the device.");
-        ESP_LOGW(TAG, "Sensor readings will show as unavailable until the gauge responds.");
+        ESP_LOGW(TAG, "BQ27220 NOT detected at 0x55! (err=%d)", (int)err);
+        ESP_LOGW(TAG, "Fuel gauge may be in SHUTDOWN mode.");
+        ESP_LOGW(TAG, "Try: charge via USB 1+ hour, then power-cycle.");
+        ESP_LOGW(TAG, "Readings will show unavailable until gauge responds.");
     }
 }
 
   
 void BQ27220Component::update() {
 
-    // If gauge was previously unavailable, try probing again each update cycle.
-    // This way, if the battery charges enough to wake the gauge, we'll pick it up.
+    // If gauge was previously unavailable, try probing again
     if (!this->gauge_available_) {
         uint8_t probe[2] = {0, 0};
-        if (this->read_register(static_cast<uint8_t>(CommandControl), probe, 2)) {
+        auto err = this->read_register(static_cast<uint8_t>(CommandControl), probe, 2);
+        if (err == i2c::ERROR_OK) {
             this->gauge_available_ = true;
-            ESP_LOGI(TAG, "BQ27220 is now responding on I2C bus! Resuming readings.");
+            ESP_LOGI(TAG, "BQ27220 is now responding! Resuming readings.");
         } else {
-            // Still not available - publish NaN for all sensors so HA shows "unavailable"
-            // instead of stale garbage values.
-            ESP_LOGD(TAG, "BQ27220 still not responding on I2C bus, skipping update.");
-            if (voltage_sensor_ != nullptr) voltage_sensor_->publish_state(NAN);
-            if (current_sensor_ != nullptr) current_sensor_->publish_state(NAN);
-            if (soc_sensor_ != nullptr) soc_sensor_->publish_state(NAN);
-            if (remaining_capacity_sensor_ != nullptr) remaining_capacity_sensor_->publish_state(NAN);
-            if (temperature_sensor_ != nullptr) temperature_sensor_->publish_state(NAN);
-            if (full_charge_capacity_sensor_ != nullptr) full_charge_capacity_sensor_->publish_state(NAN);
-            if (design_capacity_sensor_ != nullptr) design_capacity_sensor_->publish_state(NAN);
-            if (state_of_health_sensor_ != nullptr) state_of_health_sensor_->publish_state(NAN);
-            if (device_number_sensor_ != nullptr) device_number_sensor_->publish_state(NAN);
+            ESP_LOGD(TAG, "BQ27220 still not responding, skipping update.");
+            this->publish_all_nan_();
             return;
         }
     }
 
-    // Reset availability flag - readRegU16 will set it to false if any read fails.
+    // Reset flag; readRegU16() will set it false on any I2C error
     this->gauge_available_ = true;
 
-    // Publish Voltage 
+    // --- Read all values first, bail if comms fail ---
+
     uint16_t voltage_mv = this->getVoltage();
-    if (!this->gauge_available_) { goto comm_failed; }
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    int16_t current_raw = this->getCurrent();
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    uint16_t soc = this->getStateOfCharge();
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    uint16_t remaining_mah = this->getRemainingCapacity();
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    uint16_t raw_temp = this->getTemperature();
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    uint16_t fcc_mah = this->getFullChargeCapacity();
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    uint16_t dc_mah = this->getDesignCapacity();
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    uint16_t soh = this->getStateOfHealth();
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    uint16_t devnum = this->getDeviceNumber();
+    if (!this->gauge_available_) { this->publish_all_nan_(); return; }
+
+    // --- All reads succeeded, publish values ---
+
+    float temperature = (raw_temp * 0.1f) - 273.15f;
+
     ESP_LOGD(TAG, "Voltage: %u mV", voltage_mv);
-    if (voltage_sensor_ != nullptr) {
-      voltage_sensor_->publish_state(voltage_mv / 1000.0f); 
-    }
-  
-    // Publish Current 
-    {
-        int16_t current_raw = this->getCurrent();
-        if (!this->gauge_available_) { goto comm_failed; }
-        ESP_LOGD(TAG, "Current: %d mA", current_raw);
-        if (current_sensor_ != nullptr) {
-          current_sensor_->publish_state(current_raw);
-        }
-    }
-  
-    // Publish SOC
-    {
-        uint8_t soc = this->getStateOfCharge();
-        if (!this->gauge_available_) { goto comm_failed; }
-        ESP_LOGD(TAG, "State of Charge: %u%%", soc);
-        if (soc_sensor_ != nullptr) {
-            soc_sensor_->publish_state(soc);
-        }
-    }
-      
-    // Publish Remaining Capacity
-    {
-        uint16_t remaining_mah = this->getRemainingCapacity();
-        if (!this->gauge_available_) { goto comm_failed; }
-        ESP_LOGD(TAG, "Remaining Capacity: %u mAh", remaining_mah);
-        if (remaining_capacity_sensor_ != nullptr) {
-            remaining_capacity_sensor_->publish_state(remaining_mah);
-        }
-    }
-    
-    // Publish Temperature
-    {
-        uint16_t raw_temp = this->getTemperature();
-        if (!this->gauge_available_) { goto comm_failed; }
-        ESP_LOGD(TAG, "RawTemperature: %u", raw_temp);
-        float temperature = (raw_temp * 0.1f) - 273.15f;
-        ESP_LOGD(TAG, "Temperature: %.2f °C", temperature);
-        if (temperature_sensor_ != nullptr) {
-            temperature_sensor_->publish_state(temperature);
-        }
-    }
-    
-    // Publish Full Charge Capacity
-    {
-        uint16_t fcc_mah = this->getFullChargeCapacity();
-        if (!this->gauge_available_) { goto comm_failed; }
-        ESP_LOGD(TAG, "Full Charge Capacity: %u mAh", fcc_mah);
-        if (full_charge_capacity_sensor_ != nullptr) {
-            full_charge_capacity_sensor_->publish_state(fcc_mah);
-        }
-    }
-      
-    // Publish Design Capacity
-    {
-        uint16_t dc_mah = this->getDesignCapacity();
-        if (!this->gauge_available_) { goto comm_failed; }
-        ESP_LOGD(TAG, "Design Capacity: %u mAh", dc_mah);
-        if (design_capacity_sensor_ != nullptr) {
-            design_capacity_sensor_->publish_state(dc_mah);
-        }
-    }
+    ESP_LOGD(TAG, "Current: %d mA", current_raw);
+    ESP_LOGD(TAG, "SOC: %u%%", soc);
+    ESP_LOGD(TAG, "Remaining: %u mAh", remaining_mah);
+    ESP_LOGD(TAG, "Temp: %.2f C (raw %u)", temperature, raw_temp);
+    ESP_LOGD(TAG, "FCC: %u mAh", fcc_mah);
+    ESP_LOGD(TAG, "Design Cap: %u mAh", dc_mah);
+    ESP_LOGD(TAG, "SOH: %u%%", soh);
+    ESP_LOGD(TAG, "Device: 0x%04X", devnum);
 
-    // Publish State of Health
-    {
-        uint16_t soh = this->getStateOfHealth();
-        if (!this->gauge_available_) { goto comm_failed; }
-        ESP_LOGD(TAG, "State of Health: %u%%", soh);
-        if (state_of_health_sensor_ != nullptr) {
-            state_of_health_sensor_->publish_state(soh);
-        }
-    }
-
-    // Publish Device Number
-    {
-        uint16_t devnum = this->getDeviceNumber();
-        if (!this->gauge_available_) { goto comm_failed; }
-        ESP_LOGD(TAG, "Device Number: 0x%04X", devnum);
-        if (device_number_sensor_ != nullptr) {
-            device_number_sensor_->publish_state(devnum);
-        }
-    }
-
-    return;
-
-comm_failed:
-    ESP_LOGW(TAG, "BQ27220 communication lost during update, marking as unavailable.");
-    this->gauge_available_ = false;
-    // Publish NaN for any sensors we haven't updated yet this cycle.
-    // Already-published values this cycle were valid (pre-failure reads succeeded).
-    // On the next update() call, we'll probe and skip everything if still offline.
-    return;
+    if (voltage_sensor_ != nullptr)
+        voltage_sensor_->publish_state(voltage_mv / 1000.0f);
+    if (current_sensor_ != nullptr)
+        current_sensor_->publish_state(current_raw);
+    if (soc_sensor_ != nullptr)
+        soc_sensor_->publish_state(soc);
+    if (remaining_capacity_sensor_ != nullptr)
+        remaining_capacity_sensor_->publish_state(remaining_mah);
+    if (temperature_sensor_ != nullptr)
+        temperature_sensor_->publish_state(temperature);
+    if (full_charge_capacity_sensor_ != nullptr)
+        full_charge_capacity_sensor_->publish_state(fcc_mah);
+    if (design_capacity_sensor_ != nullptr)
+        design_capacity_sensor_->publish_state(dc_mah);
+    if (state_of_health_sensor_ != nullptr)
+        state_of_health_sensor_->publish_state(soh);
+    if (device_number_sensor_ != nullptr)
+        device_number_sensor_->publish_state(devnum);
 }
 
 }  // namespace bq27220

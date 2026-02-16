@@ -17,11 +17,8 @@
 #include "bq27220_data_memory.h"
 //END FROM LILYGO
 
-namespace esphome { // REVIEW ** should be putting imported lilygo bq27220 stuff inside of here or leave it outside? 
-namespace bq27220 { // REVIEW ** Same as previous.. Does the imported lilygo code go IN here or outside of the namespaces?
-
-
-
+namespace esphome {
+namespace bq27220 {
 
 
 //  FROM LILYGO
@@ -141,8 +138,11 @@ class BQ27220Component : public PollingComponent, public i2c::I2CDevice {
   sensor::Sensor *state_of_health_sensor_{nullptr};
   sensor::Sensor *device_number_sensor_{nullptr};
 
-  // Track whether the gauge is reachable on the I2C bus
+  // Track whether the gauge is reachable on I2C bus
   bool gauge_available_{false};
+
+  // Helper: publish NaN to all sensors
+  void publish_all_nan_();
 
   
     bool getIsCharging(void){
@@ -165,7 +165,7 @@ class BQ27220Component : public PollingComponent, public i2c::I2CDevice {
     bool fullAccess(void);
 
     // get
-    uint16_t getDeviceNumber(void);  // sub-commands
+    uint16_t getDeviceNumber(void);
     uint16_t getVoltage(void);
     int16_t getCurrent(void);
     bool getControlStatus(BQ27220ControlStatus *ctrl_sta);
@@ -179,15 +179,14 @@ class BQ27220Component : public PollingComponent, public i2c::I2CDevice {
     uint16_t getStateOfCharge(void);
     uint16_t getStateOfHealth(void);
 
-    // i2c - PATCHED: now checks return value and zeros buffer on failure
+    // i2c - FIXED: uses ErrorCode == ERROR_OK (not bool truthiness)
     uint16_t readRegU16(uint16_t reg) {
         uint8_t data[2] = {0, 0};
-        if (!this->read_register(static_cast<uint8_t>(reg), data, size_t{2})) {
-            ESP_LOGW("bq27220", "I2C read failed for register 0x%02X", reg);
+        auto err = this->read_register(static_cast<uint8_t>(reg), data, size_t{2});
+        if (err != i2c::ERROR_OK) {
+            ESP_LOGW("bq27220", "I2C read failed for register 0x%02X (err=%d)", reg, (int)err);
             this->gauge_available_ = false;
             return 0;
-        } else {
-            this->gauge_available_ = true;
         }
         return ((uint16_t) data[1] << 8) | data[0];
     }
@@ -196,23 +195,17 @@ class BQ27220Component : public PollingComponent, public i2c::I2CDevice {
         uint8_t msb = (sub_cmd >> 8);
         uint8_t lsb = (sub_cmd & 0x00FF);
         uint8_t buf[2] = { lsb, msb };
-        if (!this->write_register(static_cast<uint8_t>(CommandControl), buf, 2)) {
-            ESP_LOGW("bq27220", "I2C write failed for control sub-command 0x%04X", sub_cmd);
+        auto err = this->write_register(static_cast<uint8_t>(CommandControl), buf, 2);
+        if (err != i2c::ERROR_OK) {
+            ESP_LOGW("bq27220", "I2C write failed for sub-cmd 0x%04X (err=%d)", sub_cmd, (int)err);
             this->gauge_available_ = false;
             return false;
-        } else {
-            this->gauge_available_ = true;
         }
         return true;
     }
 private:
-   //rem TwoWire *wire = NULL;
-    //rem?  uint8_t addr = 0;
-    //rem int scl = -1;
-    //rem int sda = -1;
     BQ27220BatteryStatus bat_st;
 };
-
 
 // END FROM LILYGO
 
