@@ -141,6 +141,9 @@ class BQ27220Component : public PollingComponent, public i2c::I2CDevice {
   // Track whether the gauge is reachable on I2C bus
   bool gauge_available_{false};
 
+  // Track whether CEDV configuration has been applied
+  bool cedv_configured_{false};
+
   // Helper: publish NaN to all sensors
   void publish_all_nan_();
 

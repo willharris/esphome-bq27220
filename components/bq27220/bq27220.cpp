@@ -489,6 +489,7 @@ void BQ27220Component::setup() {
         ESP_LOGI(TAG, "Checking/applying CEDV configuration...");
         if (this->init(gauge_data_memory)) {
             ESP_LOGI(TAG, "CEDV configuration OK (250mAh profile)");
+            this->cedv_configured_ = true;
         } else {
             ESP_LOGW(TAG, "CEDV configuration failed! SOC readings may be inaccurate.");
             ESP_LOGW(TAG, "Voltage/current/temperature readings are still valid.");
@@ -512,6 +513,19 @@ void BQ27220Component::update() {
         if (err == i2c::ERROR_OK) {
             this->gauge_available_ = true;
             ESP_LOGI(TAG, "BQ27220 is now responding! Resuming readings.");
+
+            // If init() didn't run at setup (gauge was in SHUTDOWN), do it now
+            if (!this->cedv_configured_) {
+                uint16_t devid = this->getDeviceNumber();
+                ESP_LOGI(TAG, "BQ27220 Device Number: 0x%04X", devid);
+                ESP_LOGI(TAG, "Checking/applying CEDV configuration...");
+                if (this->init(gauge_data_memory)) {
+                    ESP_LOGI(TAG, "CEDV configuration OK (250mAh profile)");
+                    this->cedv_configured_ = true;
+                } else {
+                    ESP_LOGW(TAG, "CEDV configuration failed! Will retry next cycle.");
+                }
+            }
         } else {
             ESP_LOGD(TAG, "BQ27220 still not responding, skipping update.");
             this->publish_all_nan_();
