@@ -253,6 +253,7 @@ bool BQ27220Component::init(const BQ27220DMData *data_memory)
             break;
         }
 
+        result = true;  // All steps succeeded
     } while(0);
     return result;
 }
@@ -481,6 +482,16 @@ void BQ27220Component::setup() {
         ESP_LOGI(TAG, "BQ27220 Device Number: 0x%04X (expected 0x%04X)", devid, BQ27220_ID);
         if (devid != BQ27220_ID) {
             ESP_LOGW(TAG, "Unexpected device ID! Gauge may not be a BQ27220.");
+        }
+
+        // Initialize CEDV gauging configuration (250mAh Nesso N1 battery)
+        // This checks current config, only writes if values differ, then re-seals.
+        ESP_LOGI(TAG, "Checking/applying CEDV configuration...");
+        if (this->init(gauge_data_memory)) {
+            ESP_LOGI(TAG, "CEDV configuration OK (250mAh profile)");
+        } else {
+            ESP_LOGW(TAG, "CEDV configuration failed! SOC readings may be inaccurate.");
+            ESP_LOGW(TAG, "Voltage/current/temperature readings are still valid.");
         }
     } else {
         this->gauge_available_ = false;
